@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: "postgres:latest"
+    restart: "unless-stopped"
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: atlasdb
+      HOSTNAME: postgres
+    volumes:
+      - ./docker_sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "--host",
+          "localhost",
+          "--username",
+          "postgres",
+          "--dbname",
+          "atlas"
+        ]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+      start_period: 10s

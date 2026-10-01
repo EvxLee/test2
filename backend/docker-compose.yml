@@ -1,0 +1,58 @@
+services:
+  backend:
+    hostname: api
+    image: atlas-api
+    build:
+      context: ./product
+      dockerfile: Dockerfile
+    env_file: ".env"
+    environment:
+      DATABASE_URL: ${ATLAS_DB_API_CONNECTION_STRING}
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # - ./product/logging.local.yml:/app/logging.yml
+      - ./exports:/app/exports
+      - .:/backend
+    ports:
+      - "8081:8080"
+
+  postgres:
+    image: "pgvector/pgvector:pg16"  # PostgreSQL with pgvector extension
+    restart: "unless-stopped"
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: atlasdb
+      HOSTNAME: postgres
+      ATLAS_API_USER: ${ATLAS_DB_API_USER}
+      ATLAS_API_PASSWORD: ${ATLAS_DB_API_PASSWORD}
+    volumes:
+      - dbdata:/var/lib/postgresql
+      - ./product/db/sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "--host",
+          "localhost",
+          "--username",
+          "postgres",
+          "--dbname",
+          "atlasdb"
+        ]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  exports_data:
+  dbdata:

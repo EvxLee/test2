@@ -1,0 +1,240 @@
+From 860eb0351a905332fe1c6f811c8b297f5cf55089 Mon Sep 17 00:00:00 2001
+From: EvxLee <exl2813@berkeley.edu>
+Date: Mon, 20 Apr 2026 23:54:57 -0700
+Subject: [PATCH] Add Feature 8: eval framework wiht Precision@5 baseline (Mean
+ P@5: 0.6133)
+
+---
+ product/api/tests/evals/eval_runner.py | 220 +++++++++++++++++++++++++
+ 1 file changed, 220 insertions(+)
+ create mode 100644 product/api/tests/evals/eval_runner.py
+
+diff --git a/product/api/tests/evals/eval_runner.py b/product/api/tests/evals/eval_runner.py
+new file mode 100644
+index 0000000..d6d31e0
+--- /dev/null
++++ b/product/api/tests/evals/eval_runner.py
+@@ -0,0 +1,220 @@
++"""
++Atlas RAG eval runner — Precision@K baseline.
++
++Requires a live database and Bedrock credentials. Do not run in CI.
++
++Usage:
++    docker exec -w /backend/product/api backend-backend-1 python tests/evals/eval_runner.py
++    docker exec -w /backend/product/api backend-backend-1 python tests/evals/eval_runner.py --k 10
++    docker exec -w /backend/product/api backend-backend-1 python tests/evals/eval_runner.py --source-type project
++    docker exec -w /backend/product/api backend-backend-1 python tests/evals/eval_runner.py --save-baseline
++
++Bootstrapping labels (first-time setup):
++    Run with empty expected_source_ids, review printed results,
++    then paste the correct source_id UUIDs into queries.json.
++"""
++
++import argparse
++import json
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++# ---------------------------------------------------------------------------
++# Path setup — makes `chat.*` importable regardless of working directory
++# ---------------------------------------------------------------------------
++
++_HERE = Path(__file__).resolve().parent
++
++# Docker mounts the app at /app/api; outside Docker it's at backend/product/api
++_DOCKER_API = Path("/app/api")
++_LOCAL_API = _HERE.parents[1]  # backend/product/api/tests/evals -> backend/product/api
++_PRODUCT_API = _DOCKER_API if _DOCKER_API.exists() else _LOCAL_API
++if str(_PRODUCT_API) not in sys.path:
++    sys.path.insert(0, str(_PRODUCT_API))
++
++# Load .env from backend/ if python-dotenv is available
++try:
++    from dotenv import load_dotenv
++    load_dotenv(_HERE.parents[3] / ".env")  # backend/product/api/tests/evals -> backend/
++except ImportError:
++    pass
++
++from chat.tools import RAGTools          # noqa: E402
++from chat.llm_client import get_embedding_client  # noqa: E402
++
++# ---------------------------------------------------------------------------
++# File paths
++# ---------------------------------------------------------------------------
++
++QUERIES_FILE = _HERE / "queries.json"
++BASELINE_FILE = _HERE / "BASELINE.md"
++
++
++# ---------------------------------------------------------------------------
++# Core helpers
++# ---------------------------------------------------------------------------
++
++def load_queries(source_type_filter: str | None = None) -> list[dict]:
++    """Load queries.json, optionally filtered to one source_type."""
++    with open(QUERIES_FILE) as f:
++        queries = json.load(f)
++    if source_type_filter:
++        queries = [q for q in queries if q.get("source_type") == source_type_filter]
++    return queries
++
++
++def precision_at_k(
++    retrieved_ids: list[str],
++    expected_ids: list[str],
++    k: int,
++) -> float | None:
++    """
++    Compute Precision@K.
++
++    Returns None for unlabeled queries (empty expected_ids) so they are
++    excluded from the mean rather than dragging it down.
++    """
++    if not expected_ids:
++        return None
++    top_k = retrieved_ids[:k]
++    hits = sum(1 for rid in top_k if rid in set(expected_ids))
++    return hits / k
++
++
++# ---------------------------------------------------------------------------
++# Main eval loop
++# ---------------------------------------------------------------------------
++
++def run_eval(
++    k: int = 5,
++    source_type: str | None = None,
++    save_baseline: bool = False,
++) -> None:
++    queries = load_queries(source_type)
++    if not queries:
++        print("No queries found. Check queries.json or your --source-type filter.")
++        return
++
++    label = f"Precision@{k}"
++    print(f"Loaded {len(queries)} queries. Running {label}...\n")
++    print("=" * 60)
++
++    embedding_client = get_embedding_client()
++    tools = RAGTools(embedding_client=embedding_client)
++
++    scores: list[float] = []
++    rows: list[dict] = []
++
++    for q in queries:
++        qid = q["id"]
++        query_text = q["query"]
++        q_source_type = q.get("source_type")
++        expected = q.get("expected_source_ids", [])
++
++        search_rows = tools._semantic_search_rows(
++            query=query_text,
++            source_type=q_source_type,
++            limit=k,
++            similarity_threshold=None,
++        )
++        artifacts = [{"source_id": r.get("source_id"), "similarity": round(r.get("similarity", 0), 3)} for r in search_rows]
++        retrieved_ids = [
++            str(a["source_id"])
++            for a in artifacts
++            if a.get("source_id") is not None
++        ]
++
++        p = precision_at_k(retrieved_ids, expected, k)
++        status = "UNLABELED" if p is None else f"{label}={p:.2f}"
++
++        print(f"[{qid}] {query_text}")
++        print(f"  source_type : {q_source_type or 'any'}")
++        print(f"  retrieved   : {retrieved_ids}")
++        print(f"  expected    : {expected}")
++        print(f"  result      : {status}")
++        print()
++
++        rows.append({"id": qid, "query": query_text, "p_at_k": p})
++        if p is not None:
++            scores.append(p)
++
++    labeled = len(scores)
++    mean_p = sum(scores) / labeled if labeled else 0.0
++
++    print("=" * 60)
++    print(f"Labeled queries : {labeled} / {len(queries)}")
++    print(f"Mean {label}  : {mean_p:.4f}")
++    print("=" * 60)
++
++    if labeled == 0:
++        print(
++            "\nNo labeled queries yet. Run once to see retrieved source_ids, "
++            "then fill in expected_source_ids in queries.json."
++        )
++
++    if save_baseline:
++        _write_baseline(mean_p, k, rows, labeled, len(queries))
++        print(f"\nBaseline saved to {BASELINE_FILE}")
++
++
++# ---------------------------------------------------------------------------
++# Baseline writer
++# ---------------------------------------------------------------------------
++
++def _write_baseline(
++    mean_p: float,
++    k: int,
++    rows: list[dict],
++    labeled: int,
++    total: int,
++) -> None:
++    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
++    lines = [
++        f"# Eval Baseline — Precision@{k}",
++        "",
++        f"**Date:** {timestamp}",
++        f"**Labeled queries:** {labeled} / {total}",
++        f"**Mean Precision@{k}: {mean_p:.4f}**",
++        "",
++        "## Per-Query Results",
++        "",
++        f"| ID | Query | Source Type | P@{k} |",
++        "|---|---|---|---|",
++    ]
++    for r in rows:
++        score = f"{r['p_at_k']:.2f}" if r["p_at_k"] is not None else "unlabeled"
++        lines.append(f"| {r['id']} | {r['query']} | — | {score} |")
++    lines.append("")
++    BASELINE_FILE.write_text("\n".join(lines))
++
++
++# ---------------------------------------------------------------------------
++# Entry point
++# ---------------------------------------------------------------------------
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(
++        description="Atlas RAG eval runner — Precision@K"
++    )
++    parser.add_argument(
++        "--k",
++        type=int,
++        default=5,
++        help="Top-K results to evaluate (default: 5)",
++    )
++    parser.add_argument(
++        "--source-type",
++        type=str,
++        default=None,
++        choices=["project", "organization", "pitchbook_deal", "file"],
++        help="Only run queries matching this source_type",
++    )
++    parser.add_argument(
++        "--save-baseline",
++        action="store_true",
++        help="Write results to BASELINE.md",
++    )
++    args = parser.parse_args()
++
++    run_eval(k=args.k, source_type=args.source_type, save_baseline=args.save_baseline)
+-- 
+2.50.1 (Apple Git-155)
+

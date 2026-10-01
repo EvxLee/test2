@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+pythonpath = ["product/api", "."]
+testpaths = ["product/api/tests", "tests"]

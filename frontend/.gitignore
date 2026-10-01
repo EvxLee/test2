@@ -1,0 +1,12 @@
+.DS_Store
+.env
+/node_modules/
+.claude/
+
+# React Router
+/.react-router/
+/build/
+
+# Claude Code
+.claude/
+.claude/

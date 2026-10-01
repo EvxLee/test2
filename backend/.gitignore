@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+**/.pytest_cache/
+pytest-cache-files-*/
+**/pytest-cache-files-*/
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Environments
+.env
+.env.keys
+
+# Data folders
+data/
+output/
+exports/
+
+# Virtual environments
+venv/
+myenv/
+
+.DS_Store
+node_modules/
+
+# Claude Code
+.claude/

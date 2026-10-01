@@ -1,0 +1,2 @@
+psycopg-binary
+redis>=5.0.0

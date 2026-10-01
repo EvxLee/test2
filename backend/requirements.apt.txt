@@ -1,0 +1,4 @@
+build-essential
+libpq-dev
+libpq5
+

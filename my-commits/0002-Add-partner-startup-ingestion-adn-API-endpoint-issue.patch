@@ -1,0 +1,485 @@
+From cb7b49f10d13fb1a6d7dc2801b26cfb0166d3883 Mon Sep 17 00:00:00 2001
+From: EvxLee <exl2813@berkeley.edu>
+Date: Fri, 3 Apr 2026 00:28:11 -0700
+Subject: [PATCH] Add partner startup ingestion adn API endpoint
+
+---
+ product/api/app.py                            |  70 +++++++
+ product/api/boards_registry.py                |   4 +-
+ product/api/database/models.py                |  12 +-
+ product/api/display/routes.py                 | 174 +++++++++---------
+ .../boards/incubation/incubation_projects.py  | 108 -----------
+ 5 files changed, 167 insertions(+), 201 deletions(-)
+ delete mode 100644 product/api/monday_pull/boards/incubation/incubation_projects.py
+
+diff --git a/product/api/app.py b/product/api/app.py
+index 29f87ae..28c689f 100644
+--- a/product/api/app.py
++++ b/product/api/app.py
+@@ -1698,6 +1698,76 @@ def create_app():
+ 
+             return {"board_id": board_id, "count": len(files), "files": files}, 200
+ 
++    # ------------------------------------------------------------------
++    # Incubation project partner startups — per-stage lookup
++    # ------------------------------------------------------------------
++    @ns.route("/display/incubation/projects/<string:monday_item_id>/partners")
++    class IncubationProjectPartners(Resource):
++        @ns.doc(
++            description="Return partner startups for an incubation project, grouped by stage.",
++            params={"monday_item_id": "Monday item ID of the incubation project."},
++        )
++        def get(self, monday_item_id: str):
++            if (auth := _require_auth_wrapped()):
++                return auth
++
++            if not monday_item_id.isdigit():
++                return {"error": {"message": "monday_item_id must be a numeric value"}}, 400
++
++            from display.core.util import table_exists
++            from display.core.db import fetch_all, fetch_one
++
++            def _stage_sort_key(stage: str):
++                text = (stage or "").strip()
++                digits = "".join(ch for ch in text if ch.isdigit())
++                if digits:
++                    return (int(digits), text.lower())
++                return (999, text.lower())
++
++            def _build_partner_startup_stages(rows):
++                by_stage = {}
++                for r in rows:
++                    stage = r.get("stage") or "Unknown"
++                    by_stage.setdefault(stage, {"stage": stage, "startups": []})
++                    by_stage[stage]["startups"].append({"startup_name": r.get("startup_name")})
++                stages = list(by_stage.values())
++                stages.sort(key=lambda row: _stage_sort_key(row.get("stage") or ""))
++                for stage_row in stages:
++                    stage_row["startups"].sort(key=lambda row: (row.get("startup_name") or "").lower())
++                return stages
++
++            if not table_exists("master_dashboard", "project_partner_startups"):
++                return {"error": {"message": "Partner startups table not found"}}, 404
++
++            project = fetch_one(
++                """
++                SELECT id, source_item_id
++                FROM master_dashboard.projects
++                WHERE source_item_id = %s
++                LIMIT 1;
++                """,
++                (monday_item_id,),
++            )
++            if not project:
++                return {"error": {"message": "Project not found"}}, 404
++
++            rows = fetch_all(
++                """
++                SELECT stage, startup_name
++                FROM master_dashboard.project_partner_startups
++                WHERE project_id = %s
++                ORDER BY stage, startup_name;
++                """,
++                (str(project["id"]),),
++            )
++
++            return {
++                "monday_item_id": monday_item_id,
++                "project_id": str(project["id"]),
++                "partner_startup_stages": _build_partner_startup_stages(rows),
++                "total_partners": len(rows),
++            }, 200
++
+     return app
+ 
+ app = create_app()
+diff --git a/product/api/boards_registry.py b/product/api/boards_registry.py
+index 219096f..d3bf10d 100644
+--- a/product/api/boards_registry.py
++++ b/product/api/boards_registry.py
+@@ -1,5 +1,5 @@
+ from monday_pull.boards.gced import cycle4, cycle5
+-from monday_pull.boards.incubation import startups_ai, startups_cleantech, startups_health, incubation_projects
++from monday_pull.boards.incubation import startups_ai, startups_cleantech, startups_health
+ from monday_pull.boards.marketing import new_ventures_projs
+ from monday_pull.boards import contract_status, new_venture_proposals, korean
+ from monday_ingest.clients import PRECAP_BOARD_ENV_VARS
+@@ -13,7 +13,7 @@ BOARD_REGISTRY = {
+     "incubation_ai": (startups_ai, "MONDAY_BOARD_INCUBATION_AI_ID"),
+     "incubation_cleantech": (startups_cleantech, "MONDAY_BOARD_INCUBATION_CLEAN_TECH_ID"),
+     "incubation_health": (startups_health, "MONDAY_BOARD_INCUBATION_HEALTHCARE_ID"),
+-    "incubation_projects": (incubation_projects, "MONDAY_BOARD_INCUBATION_PROJECTS_ID"),
++    "incubation_projects": (None, "MONDAY_BOARD_INCUBATION_PROJECTS_ID"),
+ 
+     # Marketing
+     "marketing_new_ventures": (new_ventures_projs, "MONDAY_BOARD_MARKETING_NEW_VENTURES_PROJS_ID"),
+diff --git a/product/api/database/models.py b/product/api/database/models.py
+index 1df6c98..2710c5e 100644
+--- a/product/api/database/models.py
++++ b/product/api/database/models.py
+@@ -5,7 +5,7 @@ from sqlalchemy import (
+     UniqueConstraint, CheckConstraint
+ )
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+-from datetime import datetime, date
++from datetime import datetime, date, timezone
+ 
+ import uuid
+ from sqlalchemy.dialects.postgresql import UUID
+@@ -199,7 +199,7 @@ class BoardData(Base):
+     board_name: Mapped[str | None] = mapped_column(String(200))
+     group_ids: Mapped[str | None] = mapped_column(Text)
+     workspace_id: Mapped[str | None] = mapped_column(String(120))
+-    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
++    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+ 
+     board: Mapped["MondayBoard | None"] = relationship(back_populates="board_rows")
+ 
+@@ -207,7 +207,7 @@ class BoardData(Base):
+ class PartnerAuditLog(Base):
+     __tablename__ = "partner_audit_log"
+     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+-    checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
++    checked_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+     ip_address: Mapped[str | None] = mapped_column(String(45))
+     row_count: Mapped[int | None] = mapped_column(Integer)
+     duplicate_count: Mapped[int | None] = mapped_column(Integer)
+@@ -233,11 +233,11 @@ class ProjectPartnerStartup(Base):
+     stage: Mapped[str] = mapped_column(String(50), nullable=False)
+     startup_name: Mapped[str] = mapped_column(Text, nullable=False)
+     ingested_at: Mapped[datetime] = mapped_column(
+-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
++        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+     )
+     created_at: Mapped[datetime] = mapped_column(
+-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
++        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+     )
+     updated_at: Mapped[datetime] = mapped_column(
+-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
++        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+     )
+diff --git a/product/api/display/routes.py b/product/api/display/routes.py
+index 144bd8f..325a381 100644
+--- a/product/api/display/routes.py
++++ b/product/api/display/routes.py
+@@ -86,9 +86,9 @@ def apply_cursor(sort_pairs, cursor, where_sql, params):
+ def build_order_by(sort_pairs):
+     return "ORDER BY " + ", ".join(f"{quote_ident(c)} {d}" for c, d in sort_pairs)
+ 
+-def expand_includes(schema, table, rows, includes, redact_on, safe_cols_set):
+-    if not rows:
+-        return rows
++def expand_includes(schema, table, rows, includes, redact_on, safe_cols_set):
++    if not rows:
++        return rows
+     want_att = "attachments" in includes
+     want_links = "links" in includes
+     if not want_att and not want_links:
+@@ -103,60 +103,60 @@ def expand_includes(schema, table, rows, includes, redact_on, safe_cols_set):
+             # normalize to {rel, href, label}
+             rr["_links"] = [{"rel": x["rel"], "href": x["href"], "label": x["label"]} for x in get_links(schema, table, rid)]
+         out.append(rr)
+-    # sanitize (again) in case nested text exists in columns we keep
+-    return [sanitize_row(r, redact_on, safe_cols_set | {"_attachments","_links"}) for r in out]
+-
+-def _stage_sort_key(stage: str) -> tuple[int, str]:
+-    text = (stage or "").strip()
+-    digits = "".join(ch for ch in text if ch.isdigit())
+-    if digits:
+-        return (int(digits), text.lower())
+-    return (999, text.lower())
+-
+-def _build_partner_startup_stages(rows):
+-    by_stage = {}
+-    for r in rows:
+-        stage = r.get("stage") or "Unknown"
+-        by_stage.setdefault(stage, {"stage": stage, "startups": []})
+-        by_stage[stage]["startups"].append({
+-            "startup_name": r.get("startup_name"),
+-        })
+-
+-    stages = list(by_stage.values())
+-    stages.sort(key=lambda row: _stage_sort_key(row.get("stage") or ""))
+-    for stage_row in stages:
+-        stage_row["startups"].sort(key=lambda row: (row.get("startup_name") or "").lower())
+-    return stages
+-
+-def _fetch_project_partner_startups_by_project_id(project_id: str):
+-    if not table_exists("master_dashboard", "project_partner_startups"):
+-        return []
+-    return fetch_all(
+-        """
+-        SELECT stage, startup_name
+-        FROM master_dashboard.project_partner_startups
+-        WHERE project_id = %s
+-        ORDER BY stage, startup_name;
+-        """,
+-        (project_id,),
+-    )
+-
+-def _fetch_project_partner_startups_by_monday_item_id(monday_item_id: str):
+-    if not table_exists("master_dashboard", "project_partner_startups"):
+-        return None, []
+-
+-    project = fetch_one(
+-        """
+-        SELECT id, source_item_id
+-        FROM master_dashboard.projects
+-        WHERE source_item_id = %s
+-        LIMIT 1;
+-        """,
+-        (monday_item_id,),
+-    )
+-    if not project:
+-        return None, []
+-    return project, _fetch_project_partner_startups_by_project_id(str(project["id"]))
++    # sanitize (again) in case nested text exists in columns we keep
++    return [sanitize_row(r, redact_on, safe_cols_set | {"_attachments","_links"}) for r in out]
++
++def _stage_sort_key(stage: str) -> tuple[int, str]:
++    text = (stage or "").strip()
++    digits = "".join(ch for ch in text if ch.isdigit())
++    if digits:
++        return (int(digits), text.lower())
++    return (999, text.lower())
++
++def _build_partner_startup_stages(rows):
++    by_stage = {}
++    for r in rows:
++        stage = r.get("stage") or "Unknown"
++        by_stage.setdefault(stage, {"stage": stage, "startups": []})
++        by_stage[stage]["startups"].append({
++            "startup_name": r.get("startup_name"),
++        })
++
++    stages = list(by_stage.values())
++    stages.sort(key=lambda row: _stage_sort_key(row.get("stage") or ""))
++    for stage_row in stages:
++        stage_row["startups"].sort(key=lambda row: (row.get("startup_name") or "").lower())
++    return stages
++
++def _fetch_project_partner_startups_by_project_id(project_id: str):
++    if not table_exists("master_dashboard", "project_partner_startups"):
++        return []
++    return fetch_all(
++        """
++        SELECT stage, startup_name
++        FROM master_dashboard.project_partner_startups
++        WHERE project_id = %s
++        ORDER BY stage, startup_name;
++        """,
++        (project_id,),
++    )
++
++def _fetch_project_partner_startups_by_monday_item_id(monday_item_id: str):
++    if not table_exists("master_dashboard", "project_partner_startups"):
++        return None, []
++
++    project = fetch_one(
++        """
++        SELECT id, source_item_id
++        FROM master_dashboard.projects
++        WHERE source_item_id = %s
++        LIMIT 1;
++        """,
++        (monday_item_id,),
++    )
++    if not project:
++        return None, []
++    return project, _fetch_project_partner_startups_by_project_id(str(project["id"]))
+ 
+ @ns.route("/data/<string:schema>/<string:table>")
+ class ListRecords(Resource):
+@@ -251,15 +251,15 @@ class GetRecord(Resource):
+         if not row:
+             return {"error": {"message": f"{schema}.{table} id={rid} not found"}}, 404
+ 
+-        sset = set(safe_cols)
+-        row = sanitize_row(row, redact_on, sset)
+-        if "attachments" in include or "links" in include:
+-            row = expand_includes(schema, table, [row], include, redact_on, sset)[0]
+-        if schema == "master_dashboard" and table == "projects":
+-            partner_rows = _fetch_project_partner_startups_by_project_id(rid)
+-            row["partner_startup_stages"] = _build_partner_startup_stages(partner_rows)
+-            row["total_partners"] = len(partner_rows)
+-        return row, 200
++        sset = set(safe_cols)
++        row = sanitize_row(row, redact_on, sset)
++        if "attachments" in include or "links" in include:
++            row = expand_includes(schema, table, [row], include, redact_on, sset)[0]
++        if schema == "master_dashboard" and table == "projects":
++            partner_rows = _fetch_project_partner_startups_by_project_id(rid)
++            row["partner_startup_stages"] = _build_partner_startup_stages(partner_rows)
++            row["total_partners"] = len(partner_rows)
++        return row, 200
+ 
+ @ns.route("/map/<string:schema>/<string:table>")
+ class MapFeed(Resource):
+@@ -365,25 +365,29 @@ class RowLinks(Resource):
+         if (auth := require_auth()): return auth
+         return get_links(schema, table, rid), 200
+ 
+-@ns.route("/incubation/projects/<string:monday_item_id>/partners")
+-class IncubationProjectPartners(Resource):
+-    def get(self, monday_item_id: str):
+-        if (auth := require_auth()): return auth
+-
+-        if not table_exists("master_dashboard", "project_partner_startups"):
+-            return {"error": {"message": "Partner startups table not found"}}, 404
+-
+-        project, rows = _fetch_project_partner_startups_by_monday_item_id(monday_item_id)
+-
+-        return {
+-            "monday_item_id": monday_item_id,
+-            "project_id": str(project["id"]) if project else None,
+-            "partner_startup_stages": _build_partner_startup_stages(rows),
+-            "total_partners": len(rows),
+-        }, 200
+-
+-@ns.route("/attachments/<int:att_id>/redirect")
+-class AttachmentRedirect(Resource):
++@ns.route("/incubation/projects/<string:monday_item_id>/partners")
++class IncubationProjectPartners(Resource):
++    def get(self, monday_item_id: str):
++        if (auth := require_auth()): return auth
++
++        if not monday_item_id.isdigit():
++            return {"error": {"message": "monday_item_id must be a numeric value"}}, 400
++
++        if not table_exists("master_dashboard", "project_partner_startups"):
++            return {"error": {"message": "Partner startups table not found"}}, 404
++
++        project, rows = _fetch_project_partner_startups_by_monday_item_id(monday_item_id)
++
++        return {
++            "monday_item_id": monday_item_id,
++            "project_id": str(project["id"]) if project else None,
++            "partner_startup_stages": _build_partner_startup_stages(rows),
++            "total_partners": len(rows),
++        }, 200
++
++
++@ns.route("/attachments/<int:att_id>/redirect")
++class AttachmentRedirect(Resource):
+     def get(self, att_id: int):
+         """Return a redirect to a fresh file URL.
+ 
+diff --git a/product/api/monday_pull/boards/incubation/incubation_projects.py b/product/api/monday_pull/boards/incubation/incubation_projects.py
+deleted file mode 100644
+index b3116ce..0000000
+--- a/product/api/monday_pull/boards/incubation/incubation_projects.py
++++ /dev/null
+@@ -1,108 +0,0 @@
+-from monday_pull.core.engine import pull_board
+-from monday_pull.core.writers import write_json
+-
+-
+-BOARD_ID = 10000000002
+-
+-
+-def detect_stage_from_title(title: str) -> str | None:
+-    """
+-    Dynamically detect stage from column title.
+-    This avoids hardcoding fragile Monday column IDs.
+-    """
+-    if not title:
+-        return None
+-
+-    title = title.lower()
+-
+-    if "stage 3" in title:
+-        return "stage_3"
+-    elif "stage 4" in title:
+-        return "stage_4"
+-    elif "stage 5" in title:
+-        return "stage_5"
+-    elif "stage 6" in title:
+-        return "stage_6"
+-
+-    return None
+-
+-
+-def extract_project_startups(item: dict) -> list[dict]:
+-    """
+-    Extract partner startups for a single project item,
+-    grouped by stage.
+-    """
+-    results = []
+-    seen = set()
+-
+-    for col in item.get("column_values", []):
+-        # Only care about board relation columns
+-        if col.get("type") != "board_relation":
+-            continue
+-
+-        stage = detect_stage_from_title(col.get("title"))
+-
+-        # Skip irrelevant columns (like Stage 6 or others)
+-        if not stage:
+-            continue
+-
+-        # Handle null safely
+-        linked_items = col.get("linked_items") or []
+-
+-        for startup in linked_items:
+-            key = (item["id"], startup["id"], stage)
+-
+-            # Deduplicate
+-            if key in seen:
+-                continue
+-            seen.add(key)
+-
+-            results.append({
+-                "project_id": item["id"],
+-                "project_name": item["name"],
+-                "startup_id": startup["id"],
+-                "startup_name": startup["name"],
+-                "stage": stage,
+-
+-                # Optional but VERY useful for Atlas later
+-                "source": "monday",
+-                "entity_type": "project_startup_relation"
+-            })
+-
+-    return results
+-
+-
+-def run():
+-    """
+-    Main pipeline:
+-    - Pull data from Monday board
+-    - Extract startups by stage
+-    - Write normalized output
+-    """
+-
+-    data = pull_board(BOARD_ID)
+-
+-    all_results = []
+-
+-    boards = data.get("data", {}).get("boards", [])
+-    if not boards:
+-        print("No boards found.")
+-        return
+-
+-    items = boards[0].get("items_page", {}).get("items", [])
+-
+-    for item in items:
+-        extracted = extract_project_startups(item)
+-        all_results.extend(extracted)
+-
+-    # Optional: log if Stage 2 is missing entirely
+-    if not any(r["stage"] == "stage_2" for r in all_results):
+-        print("Warning: No Stage 2 startups found (column may not exist in Monday board)")
+-
+-    write_json("project_startups.json", all_results)
+-
+-    print(f"Extracted {len(all_results)} project-startup relationships")
+-
+-
+-if __name__ == "__main__":
+-    run()
+\ No newline at end of file
+-- 
+2.50.1 (Apple Git-155)
+
